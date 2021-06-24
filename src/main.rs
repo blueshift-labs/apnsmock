@@ -1,7 +1,8 @@
 
 use actix_web::http::header::ContentType;
-use actix_web::web::Bytes;
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, guard, web};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, guard, web, middleware::Logger};
+use futures::StreamExt;
+
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use serde_json::{Value, json};
 use serde::Deserialize;
@@ -29,6 +30,13 @@ struct Config {
         about = "if allok is true, server will respond with 200 status to all requests"
     )]
     all_ok: bool,
+
+    #[clap(
+        long,
+        about = "if json_success is true, server will respond {success: true} for successful requests"
+    )]
+    json_success: bool,
+
 
     #[clap(
         short='c',
@@ -135,6 +143,10 @@ pub enum ApnsMockError {
     MethodNotAllowed(String),
     #[error("Unregistered")]
     Unregistered(String),
+    #[error("InvalidPayload")]
+    InvalidPayload(String),
+    #[error("PayloadNotJson")]
+    PayloadNotJson(String),
     #[error("PayloadTooLarge")]
     PayloadTooLarge(String),
     #[error("TooManyProviderTokenUpdates")]
@@ -175,6 +187,8 @@ impl ApnsMockError {
             ApnsMockError::BadPath(id) => id.as_str(),
             ApnsMockError::MethodNotAllowed(id) => id.as_str(),
             ApnsMockError::Unregistered(id) => id.as_str(),
+            ApnsMockError::InvalidPayload(id) => id.as_str(),
+            ApnsMockError::PayloadNotJson(id) => id.as_str(),
             ApnsMockError::PayloadTooLarge(id) => id.as_str(),
             ApnsMockError::TooManyProviderTokenUpdates(id) => id.as_str(),
             ApnsMockError::TooManyRequests(id) => id.as_str(),
@@ -210,6 +224,8 @@ impl actix_web::ResponseError for ApnsMockError {
             ApnsMockError::BadPath(_) => 404,
             ApnsMockError::MethodNotAllowed(_) => 405,
             ApnsMockError::Unregistered(_) => 410,
+            ApnsMockError::InvalidPayload(_) => 400,
+            ApnsMockError::PayloadNotJson(_) => 400,
             ApnsMockError::PayloadTooLarge(_) => 413,
             ApnsMockError::TooManyProviderTokenUpdates(_) => 429,
             ApnsMockError::TooManyRequests(_) => 429,
@@ -254,7 +270,6 @@ fn validate_device_token(token: &str) -> bool {
     compiled_re.is_match(token)
 }
 
-
 #[derive(Clone, Deserialize, Debug)]
 struct  AuthTokenHeaders{
     alg: String,
@@ -266,6 +281,10 @@ struct  AuthTokenBody{
     iss: String,
     iat: i64,
 }
+
+
+const MAX_SIZE: usize = 1_048_576; // max payload size is 1Mb
+
 
 // params=Json: Object({"aps": Object({"alert": String("hi, Rajesh"), "sound": String("default")})}) request=
 // HttpRequest HTTP/2.0 POST:/3/device/9d36a62ffccd017133e5766f48f235d546c5bd445a04c4aa96bea4f43fa49176
@@ -279,17 +298,38 @@ struct  AuthTokenBody{
 //     "apns-topic": "com.blueshift.reads"
 //     "apns-id": "5a4292ba-dea6-4961-8cef-3cdb74507027"
 //     "apns-priority": "10"
-async fn push(config: web::Data<Config>, req: HttpRequest, bytes: Bytes, device_token_param: web::Path<(String,)>, params: web::Json<Value>) ->  actix_web::Result<HttpResponse, ApnsMockError> {
+async fn push_handler(config: web::Data<Config>, req: HttpRequest, mut payload: web::Payload, device_token_param: web::Path<(String,)>) ->  actix_web::Result<HttpResponse, ApnsMockError> {
     let headers = req.headers();
     let device_token = device_token_param.0.as_str();
 
     let  apns_id = headers.get("apns-id");
     if apns_id.is_none() {
         let uuid_v4 = Uuid::new_v4().to_hyphenated().to_string();
+        if config.all_ok {
+            return Ok(generate_success_response(config, uuid_v4))
+        }
         return  Err(ApnsMockError::BadMessageId(uuid_v4))
     }
-
     let apns_id = apns_id.unwrap().to_str().unwrap().to_owned();
+
+    let mut body = web::BytesMut::new();
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk.map_err(|_| ApnsMockError::InvalidPayload(apns_id.clone()))?;
+        // limit max size of in-memory payload
+        if (body.len() + chunk.len()) > MAX_SIZE {
+            return  Err(ApnsMockError::PayloadTooLarge(apns_id))
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if body.is_empty()  {
+        return  Err(ApnsMockError::PayloadEmpty(apns_id))
+    }
+
+    let params = serde_json::from_slice::<Value>(&body).map_err(|_| ApnsMockError::PayloadNotJson(apns_id.clone()))?;
+    if config.all_ok {
+        return Ok(generate_success_response(config, apns_id))
+    }
+
     if Uuid::parse_str(&apns_id).is_err() {
         return  Err(ApnsMockError::BadMessageId(apns_id))
     }
@@ -297,6 +337,7 @@ async fn push(config: web::Data<Config>, req: HttpRequest, bytes: Bytes, device_
     if !validate_device_token(device_token) {
         return  Err(ApnsMockError::BadDeviceToken(apns_id))
     }
+
     let now = chrono::offset::Utc::now().timestamp();
     let  authorization_hdr = headers.get("authorization");
     if let Some(auth) = authorization_hdr {
@@ -325,15 +366,12 @@ async fn push(config: web::Data<Config>, req: HttpRequest, bytes: Bytes, device_
             return  Err(ApnsMockError::ExpiredProviderToken(apns_id))
         }
 
+        //  Team IDs (JWT "iss" claims) starting with '1' return 403, "InvalidProviderToken"
         if token_body.iss.starts_with('1') { // Feature  for testing
             return  Err(ApnsMockError::InvalidProviderToken(apns_id))
         }
     } else if config.token_auth {
         return  Err(ApnsMockError::MissingProviderToken(apns_id))
-    }
-
-    if bytes.is_empty() {
-        return  Err(ApnsMockError::PayloadEmpty(apns_id))
     }
 
     let  apns_priority_val = headers.get("apns-priority");
@@ -364,13 +402,52 @@ async fn push(config: web::Data<Config>, req: HttpRequest, bytes: Bytes, device_
         return Err(ApnsMockError::BadExpirationDate(apns_id));
     }
 
-    println!("apns_id={:?} params={:?} request={:?}", apns_id, params, req);
+    /*
+    Preconfigured failure scenarios
+        The following scenarios produce mock rejection responses:
 
-    Ok(HttpResponse::Ok()
-        .insert_header(ContentType::json())
-        .insert_header(("apns-id", apns_id.as_str()))
-        .finish())
+        Device tokens starting with '1' return 400, "BadDeviceToken"
+        Device tokens starting with '2' return 410, "Unregistered"
+        Device tokens starting with the same letter/digit as APNS topic return 400, "DeviceTokenNotForTopic"
+        Topics starting with 'd' return 400, "TopicDisallowed"
+        Team IDs (JWT "iss" claims) starting with '1' return 403, "InvalidProviderToken"
+     */
+
+    if device_token.starts_with('1') {
+        return Err(ApnsMockError::BadDeviceToken(apns_id))
+    }
+    if device_token.starts_with('2') {
+        return Err(ApnsMockError::Unregistered(apns_id))
+    }
+
+    let token_first_char = device_token.chars().next().unwrap();
+    let topic_first_char = topic_str.chars().next().unwrap();
+    if token_first_char == topic_first_char {
+        return Err(ApnsMockError::DeviceTokenNotForTopic(apns_id))
+    }
+
+    if topic_str.starts_with('d') {
+        return Err(ApnsMockError::TopicDisallowed(apns_id))
+    }
+
+    Ok(generate_success_response(config, apns_id))
 }
+
+fn generate_success_response(config: web::Data<Config>, apns_id: String) ->  HttpResponse {
+    let mut builder = HttpResponse::Ok();
+    builder.insert_header(ContentType::json())
+           .insert_header(("apns-id", apns_id.as_str()));
+
+    if config.json_success {
+        let response = json!({
+            "success": true,
+        });
+        builder.body(response)
+    } else {
+        builder.finish()
+    }
+}
+
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -378,6 +455,7 @@ async fn main() -> std::io::Result<()> {
     let config: Config = Config::parse();
     println!("Got config={:?}", &config);
 
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
 
     // load ssl keys
     // to create a self-signed temporary cert for testing:
@@ -391,10 +469,12 @@ async fn main() -> std::io::Result<()> {
     let  address =  config.address.clone();
     HttpServer::new(move || App::new()
                                     .data(config.clone())
+                                    .wrap(Logger::new("%a %{User-Agent}i"))
+                                    //.route("/3/device/{device_token}", web::post().to(push_handler)))
                                     .service(
-                                web::resource("/3/device/{device_token}")
+                                        web::resource("/3/device/{device_token}")
                                             .guard(guard::Header("content-type", "application/json"))
-                                            .route(web::post().to(push))
+                                            .route(web::post().to(push_handler))
                                             .route(web::route().to(HttpResponse::MethodNotAllowed)),
                                     ))
         .bind_openssl(&address, builder)?
