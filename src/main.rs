@@ -2,6 +2,7 @@
 use actix_web::http::header::ContentType;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, guard, web, middleware::Logger};
 use futures::StreamExt;
+use tokio::time::{sleep, Duration};
 
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use serde_json::{Value, json};
@@ -299,6 +300,10 @@ const MAX_SIZE: usize = 1_048_576; // max payload size is 1Mb
 //     "apns-id": "5a4292ba-dea6-4961-8cef-3cdb74507027"
 //     "apns-priority": "10"
 async fn push_handler(config: web::Data<Config>, req: HttpRequest, mut payload: web::Payload, device_token_param: web::Path<(String,)>) ->  actix_web::Result<HttpResponse, ApnsMockError> {
+    if config.response_delay != 0 {
+        sleep(Duration::from_millis(config.response_delay)).await;
+    }
+
     let headers = req.headers();
     let device_token = device_token_param.0.as_str();
 
@@ -325,7 +330,7 @@ async fn push_handler(config: web::Data<Config>, req: HttpRequest, mut payload: 
         return  Err(ApnsMockError::PayloadEmpty(apns_id))
     }
 
-    let params = serde_json::from_slice::<Value>(&body).map_err(|_| ApnsMockError::PayloadNotJson(apns_id.clone()))?;
+    let _params = serde_json::from_slice::<Value>(&body).map_err(|_| ApnsMockError::PayloadNotJson(apns_id.clone()))?;
     if config.all_ok {
         return Ok(generate_success_response(config, apns_id))
     }
